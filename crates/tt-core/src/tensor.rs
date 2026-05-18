@@ -488,6 +488,52 @@ impl TtTensor {
             for v in c.iter_mut() { *v *= s; }
         }
     }
+
+    /// Element-wise (Hadamard) product T = A ⊙ B. Both operands must share
+    /// `shape`. Each output core is the *Kronecker product* of the two
+    /// input cores along the rank axes, sharing the physical mode. Interior
+    /// TT-ranks become `r_a · r_b`, so a `round()` is almost always needed
+    /// to keep storage tractable.
+    ///
+    /// Cost: O(d · n · (r_a · r_b)²) — quadratic in the rank product, which
+    /// is why rounding immediately matters.
+    pub fn hadamard(&self, other: &Self) -> Result<Self, TtError> {
+        if self.shape != other.shape {
+            return Err(TtError::ShapeMismatch {
+                expected: self.shape.clone(),
+                got: other.shape.clone(),
+            });
+        }
+        let d = self.ndim();
+        let mut new_cores = Vec::with_capacity(d);
+        for k in 0..d {
+            let a = &self.cores[k];
+            let b = &other.cores[k];
+            let (ra_pre, n_k, ra_post) = (a.shape()[0], a.shape()[1], a.shape()[2]);
+            let (rb_pre, n_k_b, rb_post) = (b.shape()[0], b.shape()[1], b.shape()[2]);
+            debug_assert_eq!(n_k, n_k_b);
+            let r_pre  = ra_pre  * rb_pre;
+            let r_post = ra_post * rb_post;
+            let mut c = Array3::<f32>::zeros((r_pre, n_k, r_post));
+            for ap in 0..ra_pre {
+                for bp in 0..rb_pre {
+                    for i in 0..n_k {
+                        let av = a.slice(ndarray::s![ap, i, ..]);
+                        let bv = b.slice(ndarray::s![bp, i, ..]);
+                        let row = ap * rb_pre + bp;
+                        for ao in 0..ra_post {
+                            let aval = av[ao];
+                            for bo in 0..rb_post {
+                                c[[row, i, ao * rb_post + bo]] = aval * bv[bo];
+                            }
+                        }
+                    }
+                }
+            }
+            new_cores.push(c);
+        }
+        Ok(Self { cores: new_cores, shape: self.shape.clone() })
+    }
 }
 
 impl fmt::Display for TtTensor {
@@ -632,6 +678,56 @@ mod tests {
         let back = tt_sum.to_dense();
         for (a, b) in sum_arr.iter().zip(back.iter()) {
             assert!(approx(*a, *b, 1e-4), "sum mismatch: {} vs {}", a, b);
+        }
+    }
+
+    #[test]
+    fn hadamard_matches_dense() {
+        let shape = [3, 4, 5];
+        let n: usize = shape.iter().product();
+        let a_v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.11).sin()).collect();
+        let b_v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.23).cos() * 0.5).collect();
+        let prod_v: Vec<f32> = a_v.iter().zip(b_v.iter()).map(|(a, b)| a * b).collect();
+        let a_arr = Array::from_shape_vec(IxDyn(&shape), a_v).unwrap();
+        let b_arr = Array::from_shape_vec(IxDyn(&shape), b_v).unwrap();
+        let prod_arr = Array::from_shape_vec(IxDyn(&shape), prod_v).unwrap();
+        let tt_a = TtTensor::from_dense(a_arr.view(), 32, 1e-12).unwrap();
+        let tt_b = TtTensor::from_dense(b_arr.view(), 32, 1e-12).unwrap();
+        let tt_prod = tt_a.hadamard(&tt_b).unwrap();
+
+        // Rank should have multiplied at interior edges.
+        let ra = tt_a.ranks();
+        let rb = tt_b.ranks();
+        let rp = tt_prod.ranks();
+        for k in 1..shape.len() {
+            assert_eq!(rp[k], ra[k] * rb[k],
+                "hadamard rank at edge {} should be product: got {}, expected {}*{}",
+                k, rp[k], ra[k], rb[k]);
+        }
+
+        let back = tt_prod.to_dense();
+        for (a, b) in prod_arr.iter().zip(back.iter()) {
+            assert!(approx(*a, *b, 1e-3), "hadamard mismatch: {} vs {}", a, b);
+        }
+    }
+
+    #[test]
+    fn hadamard_with_round_keeps_rank_bounded() {
+        // A ⊙ A: ranks square, but rounding back to original rank works.
+        let shape = [4, 4, 4];
+        let n: usize = shape.iter().product();
+        let v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.17).sin() + 0.1).collect();
+        let arr = Array::from_shape_vec(IxDyn(&shape), v.clone()).unwrap();
+        let tt = TtTensor::from_dense(arr.view(), 32, 1e-12).unwrap();
+        let mut sq = tt.hadamard(&tt).unwrap();
+        sq.round(8, 1e-6).unwrap();
+        for r in sq.ranks() { assert!(r <= 8); }
+        // Reconstructed values should still match v² element-wise.
+        let back = sq.to_dense();
+        for (orig, b) in v.iter().zip(back.iter()) {
+            let expected = orig * orig;
+            assert!(approx(*b, expected, 1e-2),
+                "expected v² ≈ {}, got {}", expected, b);
         }
     }
 
