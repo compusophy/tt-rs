@@ -15,4 +15,10 @@ pub mod smoke;
 pub mod tensor;
 
 #[cfg(feature = "cuda-11070")]
+pub mod matrix;
+
+#[cfg(feature = "cuda-11070")]
 pub use tensor::{CudaTtRuntime, CudaTtTensor, MAX_RANK};
+
+#[cfg(feature = "cuda-11070")]
+pub use matrix::{CudaTtMatrix, MAX_D};
