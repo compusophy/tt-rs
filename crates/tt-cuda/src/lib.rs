@@ -1,6 +1,18 @@
-//! `tt-cuda` — GPU TT operations. v0.1 ships a smoke test that proves the
-//! CUDA toolchain works end-to-end on the host. Real TT kernels (TT-matvec,
-//! TT-attention) land in v0.2.
+//! `tt-cuda` — GPU TT operations.
+//!
+//! v0.2 ships:
+//!   * `smoke`  — end-to-end NVRTC + vector_add toolchain validation.
+//!   * `tensor` — `CudaTtRuntime` + `CudaTtTensor` with an on-device
+//!                `tt_eval` kernel (chain-of-cores contraction).
+//!
+//! Coming: `CudaTtMatrix::matvec` (the headline op) and
+//!         `tt_attention_fwd` (the v0.4 ambition).
 
 #[cfg(feature = "cuda-11070")]
 pub mod smoke;
+
+#[cfg(feature = "cuda-11070")]
+pub mod tensor;
+
+#[cfg(feature = "cuda-11070")]
+pub use tensor::{CudaTtRuntime, CudaTtTensor, MAX_RANK};
