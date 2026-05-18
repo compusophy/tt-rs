@@ -23,3 +23,7 @@ harness = false
 [[bin]]
 name = "matvec-numbers"
 path = "src/bin/matvec_numbers.rs"
+
+[[bin]]
+name = "attention-demo"
+path = "src/bin/attention_demo.rs"

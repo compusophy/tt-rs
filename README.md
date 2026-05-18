@@ -119,6 +119,40 @@ entirely and is the natural foundation for the fused TT-attention kernel
 (v0.4) that will compete with FlashAttention-3 on the (memory,
 throughput, RULER accuracy) Pareto frontier.
 
+## Single-head attention with a TT-compressed KV cache
+
+The first vertical slice: compress a single attention head's K and V
+matrices into TT form, then compute attention via TT-matvec for each
+query. Reference is textbook dense attention on the uncompressed K, V.
+
+```sh
+cargo run -p tt-bench --release --bin attention-demo
+```
+
+On `seq = 4096, dim = 64` with K and V each at effective rank 8:
+
+| metric            | dense       | TT          | ratio        |
+|:------------------|:-----------:|:-----------:|:------------:|
+| KV cache size     |   2 048 KB  |    **4 KB** | **464 ×**    |
+| compute time      |   2 531 ms  |  14 970 ms  | 0.17 × (slower) |
+| output max-abs    | 0 (ref)     | 1.04 × 10⁻⁶ | within f32 noise |
+| output RMS        | 0 (ref)     | 1.58 × 10⁻⁷ | within f32 noise |
+
+The memory win is the headline: **464× compression on the KV cache**,
+with the attention output indistinguishable from the dense reference at
+f32 precision. The speed gap is expected and well-understood — this
+prototype runs the TT path through the per-query CPU loop with no
+batching. The v0.4 fused TT-attention kernel will:
+
+1. Run on the GPU (device-resident matvec is already wired in v0.2).
+2. Batch the per-query work across one launch.
+3. Fuse the K-projection / softmax / V-projection into a single pass
+   that mirrors FlashAttention's reasoning about shared-memory tiles.
+
+Even at the current speed, the cache compression is what enables the
+long-context regime: a 256k-token context with the same compression
+ratio fits in 256 KB instead of 128 MB per layer.
+
 ## Matrices the size of small datasets
 
 Building a TT-matrix doesn't require materialising a dense intermediate.
