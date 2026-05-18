@@ -79,36 +79,45 @@ CUDA Toolkit 11.7 on Windows.
 
 A square `rows × cols` low-rank matrix is decomposed into a TT-matrix of
 depth `d` (uniform mode size 4), then multiplied by a random vector. All
-three paths produce bit-close outputs (`< 1e-3`).
+four paths produce bit-close outputs (`< 1e-3`).
 
-| rows  | cols  | d | rank | compression | dense_ms | cpu_tt_ms | gpu_tt_ms |
-|------:|------:|--:|-----:|------------:|---------:|----------:|----------:|
-|    16 |    16 | 2 |    4 |       3.2 × |    0.000 |     0.009 |     0.161 |
-|    64 |    64 | 3 |    8 |      19.7 × |    0.003 |     0.023 |     0.523 |
-|   256 |   256 | 4 |   16 |     123.2 × |    0.073 |     0.311 |     2.377 |
-|  1024 |  1024 | 5 |   16 |     136.3 × |    1.000 |    12.204 |    58.756 |
-|  4096 |  4096 | 6 |   16 |     700.9 × |   15.950 |   150.577 |   527.812 |
-| 16384 | 16384 | 7 |   16 |   **8244 ×** |  321.118 |   909.598 |  3796.241 |
+| rows  | cols  | d | rank | compression | dense_ms | cpu_tt_ms | gpu_naive_ms | **gpu_smart_ms** |
+|------:|------:|--:|-----:|------------:|---------:|----------:|-------------:|-----------------:|
+|    16 |    16 | 2 |    4 |       3.2 × |    0.000 |     0.011 |        0.078 |        0.075 |
+|    64 |    64 | 3 |    8 |      19.7 × |    0.002 |     0.024 |        0.538 |        0.282 |
+|   256 |   256 | 4 |   16 |     123.2 × |    0.051 |     0.221 |        2.946 |    **0.195** |
+|  1024 |  1024 | 5 |   16 |     136.3 × |    1.102 |    13.338 |       58.356 |    **0.568** |
+|  4096 |  4096 | 6 |   16 |     700.9 × |   15.048 |   163.284 |      611.770 |    **0.315** |
+| 16384 | 16384 | 7 |   16 |  **8244 ×** |  329.379 |   957.102 |     3499.878 |    **0.983** |
 
-**The headline.** At 16384×16384, the dense matrix is 1 GB; the TT
-factorisation is ~130 KB — an 8000× memory win on a single matrix.
-This is the property that lets a TT-compressed KV cache fit
-256k-token contexts on a 24 GB consumer GPU (the v0.4 target).
+**Two headlines.**
 
-**The caveat.** At v0.2, the matvec *kernels* (both CPU and GPU) are
-still slower per-call than dense BLAS at these sizes. Dense wins on
-absolute time because (a) the dense reference is tightly SIMD-vectorised
-LAPACK, and (b) the v0.2 GPU kernel computes one output element per
-thread and re-derives the chain prefix on every J — same big-O as dense
-matmul × a small constant. The interesting wedge is at sizes where the
-dense matrix doesn't *fit* (≥100k modes per side); there the answer
-becomes "TT works, dense OOMs."
+**1. Memory.** At 16384×16384, the dense matrix is 1 GB; the TT
+factorisation is ~130 KB — **8244× smaller**. This is the property
+that lets a TT-compressed KV cache fit a 256k-token context into a
+24 GB consumer GPU (the v0.4 target).
 
-**v0.3 closes the speed gap.** The next kernel shares the row-side chain
-prefix across the J-loop in shared memory (drops one factor of `d` and
-gives the warps something to cache), then moves to fp16 + `wmma` tensor
-cores. Both are pure rewrites of `tt_matvec.cu`; the upload path and
-correctness tests don't change.
+**2. Speed.** The smart kernel walks the TT cores mode-by-mode (two
+small kernels — `row_contract` + `col_contract` — dispatched in
+sequence) instead of the naive "one thread per output element" approach.
+The result on the 3090:
+
+- **47× faster than dense matvec at 4096×4096** (0.32 ms vs 15.0 ms)
+- **335× faster than dense matvec at 16384×16384** (0.98 ms vs 329 ms)
+
+At those sizes we're memory-bandwidth bound on a few-KB working
+buffer rather than compute bound on a million-FLOP matrix. The
+work scales as O(d · r² · max_mode · ∏others), not O(M · N).
+
+The naive kernel is left in the binary for the table — both
+correctness tests still pass against it.
+
+**Coming.** The host→device transfer of x and the device→host transfer
+of y are *included* in the smart timings, but the v0.2 API is host-in /
+host-out. A device-resident API in v0.3 will drop the transfer overhead
+entirely and is the natural foundation for the fused TT-attention kernel
+(v0.4) that will compete with FlashAttention-3 on the (memory,
+throughput, RULER accuracy) Pareto frontier.
 
 ## Layout
 

@@ -96,6 +96,55 @@ extern "C" __global__ void tt_matvec(
 
     y[out_idx] = acc;
 }
+
+// ---------- mode-by-mode smart kernels ----------
+// row_contract: W_in shape (prefix, r_pre, suffix), G shape (r_pre, m_k, r_post)
+// W_out shape (prefix, m_k, r_post, suffix). One thread per output element.
+extern "C" __global__ void row_contract(
+    const float* __restrict__ w_in,
+    const float* __restrict__ cores,
+    int          g_offset,
+    float*       __restrict__ w_out,
+    int prefix, int r_pre, int m_k, int r_post, int suffix
+) {
+    int total = prefix * m_k * r_post * suffix;
+    int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= total) return;
+    int s = o % suffix;          int t = o / suffix;
+    int rp = t % r_post;         t /= r_post;
+    int m  = t % m_k;            int p = t / m_k;
+    float acc = 0.0f;
+    for (int r = 0; r < r_pre; ++r) {
+        acc += w_in[p * (r_pre * suffix) + r * suffix + s]
+             * cores[g_offset + r * (m_k * r_post) + m * r_post + rp];
+    }
+    w_out[o] = acc;
+}
+
+// col_contract: W_in shape (prefix, r_pre, n_k, suffix), G shape (r_pre, n_k, r_post)
+// W_out shape (prefix, r_post, suffix). One thread per output element.
+extern "C" __global__ void col_contract(
+    const float* __restrict__ w_in,
+    const float* __restrict__ cores,
+    int          g_offset,
+    float*       __restrict__ w_out,
+    int prefix, int r_pre, int n_k, int r_post, int suffix
+) {
+    int total = prefix * r_post * suffix;
+    int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= total) return;
+    int s = o % suffix;
+    int rp = (o / suffix) % r_post;
+    int p  = o / (suffix * r_post);
+    float acc = 0.0f;
+    for (int r = 0; r < r_pre; ++r) {
+        for (int n = 0; n < n_k; ++n) {
+            acc += w_in[p * (r_pre * n_k * suffix) + r * (n_k * suffix) + n * suffix + s]
+                 * cores[g_offset + r * (n_k * r_post) + n * r_post + rp];
+        }
+    }
+    w_out[o] = acc;
+}
 "#;
 
 fn s<E: std::fmt::Debug>(e: E) -> String { format!("{e:?}") }
@@ -107,18 +156,32 @@ pub struct CudaTtMatrix {
     core_dims: CudaSlice<i32>,
     m_shape_dev: CudaSlice<i32>,
     n_shape_dev: CudaSlice<i32>,
+    /// Per-core (r_pre, mode, r_post) — host copy for orchestrating the smart kernel.
+    core_dims_host: Vec<(usize, usize, usize)>,
+    /// Per-core offset (in floats) into `cores` — host copy.
+    core_offsets_host: Vec<usize>,
     d: usize,
     m_shape: Vec<usize>,
     n_shape: Vec<usize>,
 }
 
-/// Load the `tt_matvec` kernel into the runtime's module store. Idempotent.
+/// Load all TT-matrix kernels (`tt_matvec`, `row_contract`, `col_contract`)
+/// into the runtime's module store. Idempotent.
 pub fn ensure_matvec_loaded(runtime: &CudaTtRuntime) -> Result<(), String> {
-    if runtime.device.get_func("tt_matrix_kernels", "tt_matvec").is_some() {
+    if runtime.device.get_func("tt_matrix_kernels", "tt_matvec").is_some()
+        && runtime.device.get_func("tt_matrix_kernels", "row_contract").is_some()
+    {
         return Ok(());
     }
     let ptx = compile_ptx(KERNEL_SRC).map_err(s)?;
-    runtime.device.load_ptx(ptx, "tt_matrix_kernels", &["tt_matvec"]).map_err(s)?;
+    runtime
+        .device
+        .load_ptx(
+            ptx,
+            "tt_matrix_kernels",
+            &["tt_matvec", "row_contract", "col_contract"],
+        )
+        .map_err(s)?;
     Ok(())
 }
 
@@ -140,15 +203,19 @@ impl CudaTtMatrix {
 
         let mut offsets = Vec::with_capacity(n_cores + 1);
         let mut dims = Vec::with_capacity(3 * n_cores);
+        let mut dims_host: Vec<(usize, usize, usize)> = Vec::with_capacity(n_cores);
+        let mut offsets_host: Vec<usize> = Vec::with_capacity(n_cores);
         let mut flat: Vec<f32> = Vec::new();
         let mut acc: i32 = 0;
         for k in 0..n_cores {
             offsets.push(acc);
+            offsets_host.push(acc as usize);
             let g = &tm.tt.cores[k];
             let (r_pre, mode, r_post) = (g.shape()[0], g.shape()[1], g.shape()[2]);
             dims.push(r_pre as i32);
             dims.push(mode as i32);
             dims.push(r_post as i32);
+            dims_host.push((r_pre, mode, r_post));
             flat.extend(g.iter().copied());
             acc += (r_pre * mode * r_post) as i32;
         }
@@ -167,6 +234,8 @@ impl CudaTtMatrix {
         Ok(Self {
             runtime,
             cores, core_offsets, core_dims, m_shape_dev, n_shape_dev,
+            core_dims_host: dims_host,
+            core_offsets_host: offsets_host,
             d,
             m_shape: tm.m_shape.clone(),
             n_shape: tm.n_shape.clone(),
@@ -220,6 +289,106 @@ impl CudaTtMatrix {
         let y_flat = dev.dtoh_sync_copy(&y_dev).map_err(s)?;
         ArrayD::from_shape_vec(IxDyn(&self.m_shape), y_flat).map_err(s)
     }
+
+    /// y = M x — mode-by-mode "smart" implementation. Walks the 2d cores
+    /// in sequence; each core contracts an axis of the working buffer via
+    /// a dedicated kernel (`row_contract` or `col_contract`). Total work
+    /// is O(d · r² · max_factor · ∏others) rather than the per-element
+    /// kernel's O(∏m · ∏n · d · r²).
+    pub fn matvec_smart_host(&self, x: ArrayViewD<f32>) -> Result<ArrayD<f32>, String> {
+        if x.shape() != self.n_shape.as_slice() {
+            return Err(format!(
+                "x shape {:?} != n_shape {:?}",
+                x.shape(), self.n_shape
+            ));
+        }
+        let dev = &self.runtime.device;
+        let x_flat: Vec<f32> = x.iter().copied().collect();
+        let mut w_dev = dev.htod_copy(x_flat).map_err(s)?;
+        let mut w_shape: Vec<usize> = std::iter::once(1usize)
+            .chain(self.n_shape.iter().copied())
+            .collect();
+
+        let mut m_done = 0usize;
+
+        for k in 0..(2 * self.d) {
+            let (r_pre, mode, r_post) = self.core_dims_host[k];
+            let g_offset = self.core_offsets_host[k] as i32;
+            let is_row = k % 2 == 0;
+
+            if is_row {
+                debug_assert_eq!(w_shape[m_done], r_pre);
+                let prefix: usize = w_shape[..m_done].iter().product();
+                let suffix: usize = w_shape[m_done + 1..].iter().product();
+                let m_k = mode;
+                let out_size = prefix * m_k * r_post * suffix;
+                let mut w_out = dev.alloc_zeros::<f32>(out_size).map_err(s)?;
+                let block: u32 = 256;
+                let grid: u32 = (out_size as u32 + block - 1) / block;
+                let cfg = LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (block, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let f = dev
+                    .get_func("tt_matrix_kernels", "row_contract")
+                    .ok_or_else(|| "row_contract kernel not loaded".to_string())?;
+                unsafe {
+                    f.launch(cfg, (
+                        &w_dev,
+                        &self.cores,
+                        g_offset,
+                        &mut w_out,
+                        prefix as i32, r_pre as i32, m_k as i32, r_post as i32, suffix as i32,
+                    )).map_err(s)?;
+                }
+                w_dev = w_out;
+                w_shape.remove(m_done);
+                w_shape.insert(m_done, m_k);
+                w_shape.insert(m_done + 1, r_post);
+                m_done += 1;
+            } else {
+                debug_assert_eq!(w_shape[m_done], r_pre);
+                debug_assert_eq!(w_shape[m_done + 1], mode);
+                let prefix: usize = w_shape[..m_done].iter().product();
+                let suffix: usize = w_shape[m_done + 2..].iter().product();
+                let n_k = mode;
+                let out_size = prefix * r_post * suffix;
+                let mut w_out = dev.alloc_zeros::<f32>(out_size).map_err(s)?;
+                let block: u32 = 256;
+                let grid: u32 = (out_size as u32 + block - 1) / block;
+                let cfg = LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (block, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let f = dev
+                    .get_func("tt_matrix_kernels", "col_contract")
+                    .ok_or_else(|| "col_contract kernel not loaded".to_string())?;
+                unsafe {
+                    f.launch(cfg, (
+                        &w_dev,
+                        &self.cores,
+                        g_offset,
+                        &mut w_out,
+                        prefix as i32, r_pre as i32, n_k as i32, r_post as i32, suffix as i32,
+                    )).map_err(s)?;
+                }
+                w_dev = w_out;
+                w_shape.remove(m_done);
+                w_shape.remove(m_done);
+                w_shape.insert(m_done, r_post);
+            }
+        }
+
+        debug_assert_eq!(w_shape.len(), self.d + 1);
+        debug_assert_eq!(*w_shape.last().unwrap(), 1);
+        w_shape.pop();
+
+        dev.synchronize().map_err(s)?;
+        let y_flat = dev.dtoh_sync_copy(&w_dev).map_err(s)?;
+        ArrayD::from_shape_vec(IxDyn(&w_shape), y_flat).map_err(s)
+    }
 }
 
 #[cfg(test)]
@@ -261,6 +430,30 @@ mod tests {
         for (a, b) in y_gpu.iter().zip(y_dense.iter()) {
             assert!((a - b).abs() < 1e-3,
                 "matvec mismatch: gpu={} dense={} diff={}", a, b, (a-b).abs());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires CUDA-capable GPU; run with `cargo test -- --ignored`"]
+    fn cuda_matvec_smart_matches_dense_random() {
+        let rows = 16usize;
+        let cols = 16usize;
+        let data_v: Vec<f32> = (0..rows*cols)
+            .map(|i| ((i as f32) * 0.31).sin() * 0.7 + ((i as f32) * 0.13).cos() * 0.4)
+            .collect();
+        let data = Array2::from_shape_vec((rows, cols), data_v.clone()).unwrap();
+
+        let tm = TtMatrix::from_dense(&[4, 4], &[4, 4], data.view(), 8, 1e-8).unwrap();
+        let rt = CudaTtRuntime::new(0).expect("init CUDA runtime");
+        let cm = CudaTtMatrix::upload(rt, &tm).expect("upload");
+
+        let x_v: Vec<f32> = (0..cols).map(|i| ((i as f32) - 7.0) * 0.25).collect();
+        let x_arr = ndarray::ArrayD::from_shape_vec(IxDyn(&[4, 4]), x_v.clone()).unwrap();
+        let y_smart: Vec<f32> = cm.matvec_smart_host(x_arr.view()).unwrap().iter().copied().collect();
+        let y_dense = dense_matvec(&data, &x_v);
+        for (a, b) in y_smart.iter().zip(y_dense.iter()) {
+            assert!((a - b).abs() < 1e-3,
+                "smart matvec mismatch: gpu={} dense={} diff={}", a, b, (a-b).abs());
         }
     }
 

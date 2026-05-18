@@ -89,9 +89,10 @@ fn main() {
     };
     eprintln!();
 
-    println!("{:>6} {:>6} {:>3} {:>5} {:>14} {:>10} {:>10} {:>10}",
-        "rows", "cols", "d", "rank", "compression", "dense_ms", "cpu_tt_ms", "gpu_tt_ms");
-    println!("{}", "-".repeat(82));
+    println!("{:>6} {:>6} {:>3} {:>5} {:>14} {:>10} {:>10} {:>11} {:>11}",
+        "rows", "cols", "d", "rank", "compression",
+        "dense_ms", "cpu_tt_ms", "gpu_naive_ms", "gpu_smart_ms");
+    println!("{}", "-".repeat(102));
 
     for &(rows, cols, d, base, true_rank) in configs {
         if rows.pow(1) != base.pow(d as u32) {
@@ -119,25 +120,27 @@ fn main() {
         // Time CPU TT matvec.
         let (_y_cpu, cpu_tt_ms) = time(|| tm.matvec(x_nd.view()).unwrap());
 
-        // Time GPU TT matvec (if available).
-        let gpu_tt_ms_str = if let Some(rt_arc) = &rt {
+        // Time GPU TT matvec — both kernels, if GPU is available.
+        let (gpu_naive_str, gpu_smart_str) = if let Some(rt_arc) = &rt {
             match CudaTtMatrix::upload(rt_arc.clone(), &tm) {
                 Ok(cm) => {
-                    // warm-up dispatch
+                    // warm-up each path
                     let _ = cm.matvec_host(x_nd.view()).unwrap();
-                    let (_y_gpu, ms) = time(|| cm.matvec_host(x_nd.view()).unwrap());
-                    format!("{ms:.3}")
+                    let _ = cm.matvec_smart_host(x_nd.view()).unwrap();
+                    let (_, n_ms) = time(|| cm.matvec_host(x_nd.view()).unwrap());
+                    let (_, s_ms) = time(|| cm.matvec_smart_host(x_nd.view()).unwrap());
+                    (format!("{n_ms:.3}"), format!("{s_ms:.3}"))
                 }
-                Err(e) => format!("err: {e}"),
+                Err(e) => (format!("err: {e}"), "-".to_string()),
             }
-        } else { "-".to_string() };
+        } else { ("-".to_string(), "-".to_string()) };
 
         let _ = ranks;
 
         println!(
-            "{:>6} {:>6} {:>3} {:>5} {:>13.1}× {:>10.3} {:>10.3} {:>10}",
+            "{:>6} {:>6} {:>3} {:>5} {:>13.1}× {:>10.3} {:>10.3} {:>11} {:>11}",
             rows, cols, d, true_rank, ratio,
-            dense_ms, cpu_tt_ms, gpu_tt_ms_str,
+            dense_ms, cpu_tt_ms, gpu_naive_str, gpu_smart_str,
         );
     }
     eprintln!();
