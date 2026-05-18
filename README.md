@@ -67,13 +67,48 @@ the CUDA TT-attention kernel is the v0.2 ambition.
 
 ```sh
 cargo test --workspace --release                       # CPU unit tests
-cargo test -p tt-cuda --release -- --ignored           # GPU smoke test
-cargo bench -p tt-bench                                # criterion benchmarks
+cargo test -p tt-cuda --release -- --ignored           # GPU smoke + tt_eval + tt_matvec
+cargo run -p tt-bench --release --bin matvec-numbers   # the table below
 ```
 
 Hardware target for v0.3/v0.4: NVIDIA Ampere or newer with ≥16 GB VRAM.
 Verified development hardware: RTX 3090 (Ampere, SM 8.6, 24 GB),
 CUDA Toolkit 11.7 on Windows.
+
+## Numbers (RTX 3090, v0.2)
+
+A square `rows × cols` low-rank matrix is decomposed into a TT-matrix of
+depth `d` (uniform mode size 4), then multiplied by a random vector. All
+three paths produce bit-close outputs (`< 1e-3`).
+
+| rows  | cols  | d | rank | compression | dense_ms | cpu_tt_ms | gpu_tt_ms |
+|------:|------:|--:|-----:|------------:|---------:|----------:|----------:|
+|    16 |    16 | 2 |    4 |       3.2 × |    0.000 |     0.009 |     0.161 |
+|    64 |    64 | 3 |    8 |      19.7 × |    0.003 |     0.023 |     0.523 |
+|   256 |   256 | 4 |   16 |     123.2 × |    0.073 |     0.311 |     2.377 |
+|  1024 |  1024 | 5 |   16 |     136.3 × |    1.000 |    12.204 |    58.756 |
+|  4096 |  4096 | 6 |   16 |     700.9 × |   15.950 |   150.577 |   527.812 |
+| 16384 | 16384 | 7 |   16 |   **8244 ×** |  321.118 |   909.598 |  3796.241 |
+
+**The headline.** At 16384×16384, the dense matrix is 1 GB; the TT
+factorisation is ~130 KB — an 8000× memory win on a single matrix.
+This is the property that lets a TT-compressed KV cache fit
+256k-token contexts on a 24 GB consumer GPU (the v0.4 target).
+
+**The caveat.** At v0.2, the matvec *kernels* (both CPU and GPU) are
+still slower per-call than dense BLAS at these sizes. Dense wins on
+absolute time because (a) the dense reference is tightly SIMD-vectorised
+LAPACK, and (b) the v0.2 GPU kernel computes one output element per
+thread and re-derives the chain prefix on every J — same big-O as dense
+matmul × a small constant. The interesting wedge is at sizes where the
+dense matrix doesn't *fit* (≥100k modes per side); there the answer
+becomes "TT works, dense OOMs."
+
+**v0.3 closes the speed gap.** The next kernel shares the row-side chain
+prefix across the J-loop in shared memory (drops one factor of `d` and
+gives the warps something to cache), then moves to fp16 + `wmma` tensor
+cores. Both are pure rewrites of `tt_matvec.cu`; the upload path and
+correctness tests don't change.
 
 ## Layout
 

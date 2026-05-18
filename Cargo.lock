@@ -739,6 +739,7 @@ dependencies = [
  "ndarray",
  "rand",
  "tt-core",
+ "tt-cuda",
 ]
 
 [[package]]

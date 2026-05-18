@@ -9,6 +9,7 @@ description = "Benchmark harness for TT-core and TT-CUDA, with baselines."
 
 [dependencies]
 tt-core = { path = "../tt-core" }
+tt-cuda = { path = "../tt-cuda" }
 ndarray = { workspace = true }
 
 [dev-dependencies]
@@ -18,3 +19,7 @@ rand = { workspace = true }
 [[bench]]
 name = "matvec"
 harness = false
+
+[[bin]]
+name = "matvec-numbers"
+path = "src/bin/matvec_numbers.rs"
