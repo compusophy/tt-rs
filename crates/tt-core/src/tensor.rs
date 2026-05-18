@@ -261,6 +261,88 @@ impl TtTensor {
         *self = Self::from_dense(dense.view(), max_rank, tol)?;
         Ok(())
     }
+
+    /// Element-wise sum T = A + B. Both operands must share `shape`.
+    ///
+    /// Construction: interior cores are formed by block-diagonal stacking,
+    /// so the resulting TT-rank at each interior edge is the sum of the
+    /// two operands' ranks. The first core concatenates along `r_post`
+    /// (the only available rank); the last core concatenates along
+    /// `r_pre`. The result is mathematically exact; call `round()` after
+    /// to truncate the (now larger) ranks back to something useful.
+    pub fn add(&self, other: &Self) -> Result<Self, TtError> {
+        if self.shape != other.shape {
+            return Err(TtError::ShapeMismatch {
+                expected: self.shape.clone(),
+                got: other.shape.clone(),
+            });
+        }
+        let d = self.ndim();
+        let mut new_cores = Vec::with_capacity(d);
+
+        for k in 0..d {
+            let a = &self.cores[k];
+            let b = &other.cores[k];
+            let (ra_pre, n_k, ra_post) = (a.shape()[0], a.shape()[1], a.shape()[2]);
+            let (rb_pre, n_k_b, rb_post) = (b.shape()[0], b.shape()[1], b.shape()[2]);
+            debug_assert_eq!(n_k, n_k_b, "physical mode mismatch at core {k}");
+
+            if d == 1 {
+                // Single-mode tensor: both cores are (1, n, 1). Plain add.
+                let mut c = Array3::<f32>::zeros((1, n_k, 1));
+                for i in 0..n_k { c[[0, i, 0]] = a[[0, i, 0]] + b[[0, i, 0]]; }
+                new_cores.push(c);
+            } else if k == 0 {
+                // (1, n_k, ra_post + rb_post): concat along r_post.
+                let r_post = ra_post + rb_post;
+                let mut c = Array3::<f32>::zeros((1, n_k, r_post));
+                for i in 0..n_k {
+                    for j in 0..ra_post { c[[0, i, j]]            = a[[0, i, j]]; }
+                    for j in 0..rb_post { c[[0, i, ra_post + j]]  = b[[0, i, j]]; }
+                }
+                new_cores.push(c);
+            } else if k == d - 1 {
+                // (ra_pre + rb_pre, n_k, 1): concat along r_pre.
+                let r_pre = ra_pre + rb_pre;
+                let mut c = Array3::<f32>::zeros((r_pre, n_k, 1));
+                for i in 0..n_k {
+                    for j in 0..ra_pre { c[[j, i, 0]]              = a[[j, i, 0]]; }
+                    for j in 0..rb_pre { c[[ra_pre + j, i, 0]]     = b[[j, i, 0]]; }
+                }
+                new_cores.push(c);
+            } else {
+                // Interior core: block-diagonal across both rank axes.
+                let r_pre  = ra_pre  + rb_pre;
+                let r_post = ra_post + rb_post;
+                let mut c = Array3::<f32>::zeros((r_pre, n_k, r_post));
+                for ip in 0..ra_pre {
+                    for i in 0..n_k {
+                        for jp in 0..ra_post {
+                            c[[ip, i, jp]] = a[[ip, i, jp]];
+                        }
+                    }
+                }
+                for ip in 0..rb_pre {
+                    for i in 0..n_k {
+                        for jp in 0..rb_post {
+                            c[[ra_pre + ip, i, ra_post + jp]] = b[[ip, i, jp]];
+                        }
+                    }
+                }
+                new_cores.push(c);
+            }
+        }
+
+        Ok(Self { cores: new_cores, shape: self.shape.clone() })
+    }
+
+    /// In-place scalar multiplication T ← s · T. Cost is O(first core size);
+    /// only one core needs scaling because the chain is multilinear.
+    pub fn scale(&mut self, s: f32) {
+        if let Some(c) = self.cores.first_mut() {
+            for v in c.iter_mut() { *v *= s; }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -332,6 +414,70 @@ mod tests {
         let tt_norm_sq = tt.norm_sq();
         assert!(approx(tt_norm_sq, dense_norm_sq, 1e-3),
                 "norm² mismatch: tt={tt_norm_sq}, dense={dense_norm_sq}");
+    }
+
+    #[test]
+    fn add_matches_dense() {
+        let shape = [4, 5, 6];
+        let n: usize = shape.iter().product();
+        let a_v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.13).sin()).collect();
+        let b_v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.31).cos() * 0.5).collect();
+        let sum_v: Vec<f32> = a_v.iter().zip(b_v.iter()).map(|(a, b)| a + b).collect();
+
+        let a_arr   = Array::from_shape_vec(IxDyn(&shape), a_v.clone()).unwrap();
+        let b_arr   = Array::from_shape_vec(IxDyn(&shape), b_v.clone()).unwrap();
+        let sum_arr = Array::from_shape_vec(IxDyn(&shape), sum_v.clone()).unwrap();
+
+        let tt_a = TtTensor::from_dense(a_arr.view(), 32, 1e-12).unwrap();
+        let tt_b = TtTensor::from_dense(b_arr.view(), 32, 1e-12).unwrap();
+        let tt_sum = tt_a.add(&tt_b).unwrap();
+
+        // Ranks should sum at the interior edge (or be ≤ the algebraic limit).
+        let ra = tt_a.ranks();
+        let rb = tt_b.ranks();
+        let rs = tt_sum.ranks();
+        for k in 1..shape.len() {
+            assert_eq!(rs[k], ra[k] + rb[k], "rank at edge {} should be sum", k);
+        }
+
+        // Reconstruction matches dense element-wise.
+        let back = tt_sum.to_dense();
+        for (a, b) in sum_arr.iter().zip(back.iter()) {
+            assert!(approx(*a, *b, 1e-4), "sum mismatch: {} vs {}", a, b);
+        }
+    }
+
+    #[test]
+    fn add_then_round_recovers_compact_form() {
+        // (a + (-a)) should round to (almost) zero.
+        let shape = [4, 5, 6];
+        let n: usize = shape.iter().product();
+        let a_v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.13).sin()).collect();
+        let a_arr = Array::from_shape_vec(IxDyn(&shape), a_v).unwrap();
+        let tt_a = TtTensor::from_dense(a_arr.view(), 32, 1e-12).unwrap();
+        let mut tt_neg = tt_a.clone();
+        tt_neg.scale(-1.0);
+        let mut sum = tt_a.add(&tt_neg).unwrap();
+        sum.round(8, 1e-6).unwrap();
+        let back = sum.to_dense();
+        for v in back.iter() {
+            assert!(v.abs() < 1e-4, "expected near-zero, got {v}");
+        }
+    }
+
+    #[test]
+    fn scale_is_multiplicative() {
+        let shape = [3, 4, 5];
+        let n: usize = shape.iter().product();
+        let a_v: Vec<f32> = (0..n).map(|i| (i as f32) * 0.1 + 0.5).collect();
+        let arr = Array::from_shape_vec(IxDyn(&shape), a_v.clone()).unwrap();
+        let mut tt = TtTensor::from_dense(arr.view(), 32, 1e-12).unwrap();
+        tt.scale(3.0);
+        let back = tt.to_dense();
+        for (orig, scaled) in a_v.iter().zip(back.iter()) {
+            assert!(approx(scaled / orig, 3.0, 1e-3),
+                "expected 3× scale, got {} / {} = {}", scaled, orig, scaled / orig);
+        }
     }
 
     #[test]
