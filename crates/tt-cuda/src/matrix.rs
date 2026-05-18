@@ -11,7 +11,7 @@
 //! the J loop and use shared memory; a third-generation kernel will fuse
 //! with attention. This one establishes the upload + dispatch shape.
 
-use cudarc::driver::{CudaDevice, CudaSlice, LaunchAsync, LaunchConfig};
+use cudarc::driver::{CudaDevice, CudaSlice, DeviceSlice, LaunchAsync, LaunchConfig};
 use cudarc::nvrtc::compile_ptx;
 use std::sync::Arc;
 
@@ -389,6 +389,109 @@ impl CudaTtMatrix {
         let y_flat = dev.dtoh_sync_copy(&w_dev).map_err(s)?;
         ArrayD::from_shape_vec(IxDyn(&w_shape), y_flat).map_err(s)
     }
+
+    /// Device-resident y = M x: takes and returns CudaSlice<f32>, no host
+    /// roundtrip. This is the path the fused TT-attention kernel and chained
+    /// matvec demos build on — once the input is on the device, subsequent
+    /// matvecs against it never leave.
+    ///
+    /// The input length must equal `cols()`; the returned slice has length
+    /// `rows()`. The kernel sequence is identical to `matvec_smart_host`.
+    pub fn matvec_smart_device(
+        &self,
+        x_dev: &CudaSlice<f32>,
+    ) -> Result<CudaSlice<f32>, String> {
+        if x_dev.len() != self.cols() {
+            return Err(format!(
+                "x_dev len {} != cols {}",
+                x_dev.len(), self.cols()
+            ));
+        }
+        let dev = &self.runtime.device;
+        // Start by cloning x_dev into a fresh working buffer so we can
+        // safely free / replace it as the shape grows.
+        let mut w_dev: CudaSlice<f32> = dev.alloc_zeros::<f32>(x_dev.len()).map_err(s)?;
+        dev.dtod_copy(x_dev, &mut w_dev).map_err(s)?;
+        let mut w_shape: Vec<usize> = std::iter::once(1usize)
+            .chain(self.n_shape.iter().copied())
+            .collect();
+
+        let mut m_done = 0usize;
+
+        for k in 0..(2 * self.d) {
+            let (r_pre, mode, r_post) = self.core_dims_host[k];
+            let g_offset = self.core_offsets_host[k] as i32;
+            let is_row = k % 2 == 0;
+
+            if is_row {
+                debug_assert_eq!(w_shape[m_done], r_pre);
+                let prefix: usize = w_shape[..m_done].iter().product();
+                let suffix: usize = w_shape[m_done + 1..].iter().product();
+                let m_k = mode;
+                let out_size = prefix * m_k * r_post * suffix;
+                let mut w_out = dev.alloc_zeros::<f32>(out_size).map_err(s)?;
+                let block: u32 = 256;
+                let grid: u32 = (out_size as u32 + block - 1) / block;
+                let cfg = LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (block, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let f = dev
+                    .get_func("tt_matrix_kernels", "row_contract")
+                    .ok_or_else(|| "row_contract not loaded".to_string())?;
+                unsafe {
+                    f.launch(cfg, (
+                        &w_dev,
+                        &self.cores,
+                        g_offset,
+                        &mut w_out,
+                        prefix as i32, r_pre as i32, m_k as i32, r_post as i32, suffix as i32,
+                    )).map_err(s)?;
+                }
+                w_dev = w_out;
+                w_shape.remove(m_done);
+                w_shape.insert(m_done, m_k);
+                w_shape.insert(m_done + 1, r_post);
+                m_done += 1;
+            } else {
+                debug_assert_eq!(w_shape[m_done], r_pre);
+                debug_assert_eq!(w_shape[m_done + 1], mode);
+                let prefix: usize = w_shape[..m_done].iter().product();
+                let suffix: usize = w_shape[m_done + 2..].iter().product();
+                let n_k = mode;
+                let out_size = prefix * r_post * suffix;
+                let mut w_out = dev.alloc_zeros::<f32>(out_size).map_err(s)?;
+                let block: u32 = 256;
+                let grid: u32 = (out_size as u32 + block - 1) / block;
+                let cfg = LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (block, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let f = dev
+                    .get_func("tt_matrix_kernels", "col_contract")
+                    .ok_or_else(|| "col_contract not loaded".to_string())?;
+                unsafe {
+                    f.launch(cfg, (
+                        &w_dev,
+                        &self.cores,
+                        g_offset,
+                        &mut w_out,
+                        prefix as i32, r_pre as i32, n_k as i32, r_post as i32, suffix as i32,
+                    )).map_err(s)?;
+                }
+                w_dev = w_out;
+                w_shape.remove(m_done);
+                w_shape.remove(m_done);
+                w_shape.insert(m_done, r_post);
+            }
+        }
+
+        debug_assert_eq!(w_shape.len(), self.d + 1);
+        debug_assert_eq!(*w_shape.last().unwrap(), 1);
+        Ok(w_dev)
+    }
 }
 
 #[cfg(test)]
@@ -455,6 +558,72 @@ mod tests {
             assert!((a - b).abs() < 1e-3,
                 "smart matvec mismatch: gpu={} dense={} diff={}", a, b, (a-b).abs());
         }
+    }
+
+    #[test]
+    #[ignore = "requires CUDA-capable GPU; run with `cargo test -- --ignored`"]
+    fn cuda_matvec_smart_device_matches_host() {
+        // The device-resident API must produce the same answer as the
+        // host-in/host-out wrapper.
+        let rows = 64usize;
+        let cols = 64usize;
+        let data_v: Vec<f32> = (0..rows*cols)
+            .map(|i| ((i as f32) * 0.31).sin() * 0.7)
+            .collect();
+        let data = Array2::from_shape_vec((rows, cols), data_v).unwrap();
+        let tm = TtMatrix::from_dense(&[4, 4, 4], &[4, 4, 4], data.view(), 8, 1e-6).unwrap();
+        let rt = CudaTtRuntime::new(0).expect("init runtime");
+        let cm = CudaTtMatrix::upload(rt.clone(), &tm).unwrap();
+
+        let x_v: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.13).cos()).collect();
+        let x_arr = ndarray::ArrayD::from_shape_vec(IxDyn(&[4, 4, 4]), x_v.clone()).unwrap();
+        let y_host: Vec<f32> = cm.matvec_smart_host(x_arr.view()).unwrap().iter().copied().collect();
+
+        let x_dev = rt.device.htod_copy(x_v).unwrap();
+        let y_dev = cm.matvec_smart_device(&x_dev).unwrap();
+        let y_dev_host: Vec<f32> = rt.device.dtoh_sync_copy(&y_dev).unwrap();
+
+        for (a, b) in y_host.iter().zip(y_dev_host.iter()) {
+            assert!((a - b).abs() < 1e-6,
+                "host vs device matvec mismatch: {} vs {}", a, b);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires CUDA-capable GPU; run with `cargo test -- --ignored`"]
+    fn cuda_chained_matvec_demo() {
+        // y = M_a · M_b · x, computed entirely on the device.
+        // We compare against the dense reference y = (M_a · M_b) · x.
+        let n = 32usize;
+        let a_v: Vec<f32> = (0..n*n).map(|i| ((i as f32) * 0.41).sin() * 0.5).collect();
+        let b_v: Vec<f32> = (0..n*n).map(|i| ((i as f32) * 0.19).cos() * 0.5).collect();
+        let a = Array2::from_shape_vec((n, n), a_v).unwrap();
+        let b = Array2::from_shape_vec((n, n), b_v).unwrap();
+
+        let tm_a = TtMatrix::from_dense(&[4, 8], &[4, 8], a.view(), 16, 1e-6).unwrap();
+        let tm_b = TtMatrix::from_dense(&[4, 8], &[4, 8], b.view(), 16, 1e-6).unwrap();
+
+        let rt = CudaTtRuntime::new(0).expect("init runtime");
+        let cm_a = CudaTtMatrix::upload(rt.clone(), &tm_a).unwrap();
+        let cm_b = CudaTtMatrix::upload(rt.clone(), &tm_b).unwrap();
+
+        let x_v: Vec<f32> = (0..n).map(|i| (i as f32) * 0.1 - 1.0).collect();
+        let x_dev = rt.device.htod_copy(x_v.clone()).unwrap();
+
+        // y_dev = M_a · (M_b · x_dev) — chain on the device.
+        let mid_dev = cm_b.matvec_smart_device(&x_dev).unwrap();
+        let y_dev = cm_a.matvec_smart_device(&mid_dev).unwrap();
+        let y_gpu: Vec<f32> = rt.device.dtoh_sync_copy(&y_dev).unwrap();
+
+        // Dense reference.
+        let bx = dense_matvec(&b, &x_v);
+        let abx = dense_matvec(&a, &bx);
+        for (g, d) in y_gpu.iter().zip(abx.iter()) {
+            assert!((g - d).abs() < 1e-3,
+                "chained matvec mismatch: gpu={} dense={} diff={}",
+                g, d, (g-d).abs());
+        }
+        eprintln!("[chain] y = M_a · M_b · x agrees with dense reference within 1e-3");
     }
 
     #[test]
