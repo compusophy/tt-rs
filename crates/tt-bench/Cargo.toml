@@ -1,0 +1,20 @@
+[package]
+name = "tt-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Benchmark harness for TT-core and TT-CUDA, with baselines."
+
+[dependencies]
+tt-core = { path = "../tt-core" }
+ndarray = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+rand = { workspace = true }
+
+[[bench]]
+name = "matvec"
+harness = false

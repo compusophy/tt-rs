@@ -1,0 +1,10 @@
+/target
+Cargo.lock.bak
+.DS_Store
+*.swp
+.idea/
+.vscode/
+*.ptx
+*.cubin
+__pycache__/
+*.pyc

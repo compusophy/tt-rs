@@ -1,0 +1,18 @@
+[package]
+name = "tt-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Tensor-train (TT) tensor format — CPU operations."
+
+[dependencies]
+ndarray = { workspace = true }
+nalgebra = { workspace = true }
+num-traits = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+rand_distr = { workspace = true }
