@@ -252,13 +252,130 @@ impl TtTensor {
         w[0]
     }
 
-    /// Re-round to (max_rank, tol). v0.1 path: reconstruct → re-decompose.
-    /// v0.2 will replace this with the standard right-to-left QR sweep
-    /// followed by left-to-right truncated SVD sweep — O(d · n · r³) instead
-    /// of O(n^d).
+    /// Re-round to (max_rank, tol). O(d · n_max · r³).
+    ///
+    /// Two sweeps over the cores:
+    ///   1. Right-to-left QR pass orthogonalises each core's rows so that
+    ///      the right unfoldings are isometries. This pushes all the
+    ///      "weight" of the tensor into the left side.
+    ///   2. Left-to-right truncated SVD pass: each core's left unfolding
+    ///      is SVD-decomposed; singular values below `tol * σ_max` or
+    ///      beyond `max_rank` are dropped, and the truncation factor is
+    ///      pushed into the next core to the right.
+    ///
+    /// Result is equivalent to a fresh `from_dense` on the same tensor at
+    /// the same `(max_rank, tol)`, but never materialises the dense form —
+    /// crucial for d > 4 where dense storage would explode.
     pub fn round(&mut self, max_rank: usize, tol: f32) -> Result<(), TtError> {
-        let dense = self.to_dense();
-        *self = Self::from_dense(dense.view(), max_rank, tol)?;
+        if max_rank == 0 { return Err(TtError::InvalidRank { got: 0 }); }
+        let d = self.ndim();
+        if d <= 1 { return Ok(()); }
+
+        // ----- Pass 1: right-to-left QR orthogonalisation -----
+        for k in (1..d).rev() {
+            let g = &self.cores[k];
+            let (r_pre, n_k, r_post) = (g.shape()[0], g.shape()[1], g.shape()[2]);
+
+            // Unfold G into (r_pre, n_k * r_post) row-major (as f64).
+            // Then transpose to (n_k * r_post, r_pre) for the QR.
+            let n_cols = n_k * r_post;
+            let mt: nalgebra::DMatrix<f64> = nalgebra::DMatrix::from_fn(n_cols, r_pre, |col, row| {
+                let ni = col / r_post;
+                let rp = col % r_post;
+                g[[row, ni, rp]] as f64
+            });
+            let qr = mt.qr();
+            let q = qr.q();          // shape (n_cols, p), p = min(n_cols, r_pre)
+            let r = qr.r();          // shape (p, r_pre) upper triangular
+            let p = q.ncols();
+
+            // New core[k] = Q^T reshaped to (p, n_k, r_post).
+            let mut new_core_k = Array3::<f32>::zeros((p, n_k, r_post));
+            for i in 0..p {
+                for col in 0..n_cols {
+                    let ni = col / r_post;
+                    let rp = col % r_post;
+                    new_core_k[[i, ni, rp]] = q[(col, i)] as f32;
+                }
+            }
+            self.cores[k] = new_core_k;
+
+            // Absorb R^T (shape r_pre x p) into core[k-1] along its r_post axis.
+            // core[k-1] reshape (r_pre^{(-1)} * n_{k-1}, r_pre) becomes
+            // (r_pre^{(-1)} * n_{k-1}, p) via right-multiply.
+            let prev = &self.cores[k - 1];
+            let (rA, n_prev, rB) = (prev.shape()[0], prev.shape()[1], prev.shape()[2]);
+            debug_assert_eq!(rB, r_pre);
+            let mut new_prev = Array3::<f32>::zeros((rA, n_prev, p));
+            for a in 0..rA {
+                for np in 0..n_prev {
+                    for j in 0..p {
+                        let mut s = 0.0f64;
+                        for rr in 0..r_pre {
+                            s += (prev[[a, np, rr]] as f64) * r[(j, rr)];
+                        }
+                        new_prev[[a, np, j]] = s as f32;
+                    }
+                }
+            }
+            self.cores[k - 1] = new_prev;
+        }
+
+        // ----- Pass 2: left-to-right SVD truncation -----
+        for k in 0..(d - 1) {
+            let g = &self.cores[k];
+            let (r_pre, n_k, r_post) = (g.shape()[0], g.shape()[1], g.shape()[2]);
+
+            // Unfold G into (r_pre * n_k, r_post) f64.
+            let n_rows = r_pre * n_k;
+            let m: nalgebra::DMatrix<f64> = nalgebra::DMatrix::from_fn(n_rows, r_post, |row, col| {
+                let a = row / n_k;
+                let ni = row % n_k;
+                g[[a, ni, col]] as f64
+            });
+            let svd = m.svd(true, true);
+            let u = svd.u.ok_or(TtError::SvdFailed)?;
+            let s = svd.singular_values;
+            let vt = svd.v_t.ok_or(TtError::SvdFailed)?;
+
+            let sigma_max = s.iter().fold(0.0f64, |a, &b| a.max(b));
+            let cutoff = (tol as f64) * sigma_max;
+            let mut keep = s.iter().filter(|&&v| v > cutoff).count();
+            keep = keep.min(max_rank).min(s.len()).max(1);
+
+            // New core[k] = U[:, :keep] reshaped (r_pre, n_k, keep).
+            let mut new_g = Array3::<f32>::zeros((r_pre, n_k, keep));
+            for a in 0..r_pre {
+                for ni in 0..n_k {
+                    let row = a * n_k + ni;
+                    for j in 0..keep {
+                        new_g[[a, ni, j]] = u[(row, j)] as f32;
+                    }
+                }
+            }
+            self.cores[k] = new_g;
+
+            // Absorb diag(s[..keep]) @ V^T[..keep, :] into core[k+1] along r_pre.
+            // factor shape: (keep, r_post)
+            let next = &self.cores[k + 1];
+            let (rA, n_next, rB) = (next.shape()[0], next.shape()[1], next.shape()[2]);
+            debug_assert_eq!(rA, r_post);
+            let mut new_next = Array3::<f32>::zeros((keep, n_next, rB));
+            for i in 0..keep {
+                let sigma = s[i];
+                for nn in 0..n_next {
+                    for b in 0..rB {
+                        let mut acc = 0.0f64;
+                        for r_in in 0..r_post {
+                            acc += sigma * vt[(i, r_in)] * (next[[r_in, nn, b]] as f64);
+                        }
+                        new_next[[i, nn, b]] = acc as f32;
+                    }
+                }
+            }
+            self.cores[k + 1] = new_next;
+        }
+
         Ok(())
     }
 
@@ -444,6 +561,38 @@ mod tests {
         let back = tt_sum.to_dense();
         for (a, b) in sum_arr.iter().zip(back.iter()) {
             assert!(approx(*a, *b, 1e-4), "sum mismatch: {} vs {}", a, b);
+        }
+    }
+
+    #[test]
+    fn round_recovers_rank_after_add_self() {
+        // T + T should equal 2T. After round, ranks should match T's, not 2× T's.
+        let shape = [4, 5, 6];
+        let n: usize = shape.iter().product();
+        let a_v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.17).sin() + 0.3).collect();
+        let arr = Array::from_shape_vec(IxDyn(&shape), a_v).unwrap();
+        let tt = TtTensor::from_dense(arr.view(), 32, 1e-12).unwrap();
+        let orig_ranks = tt.ranks();
+
+        let mut summed = tt.add(&tt).unwrap();
+        let pre_round = summed.ranks();
+        // ranks should have doubled at interior edges
+        for k in 1..shape.len() {
+            assert_eq!(pre_round[k], orig_ranks[k] * 2);
+        }
+        summed.round(32, 1e-8).unwrap();
+        let post_round = summed.ranks();
+        // After round, ranks should be back at or below the originals.
+        for k in 1..shape.len() {
+            assert!(post_round[k] <= orig_ranks[k] + 1,
+                "edge {}: orig={}, after round={}", k, orig_ranks[k], post_round[k]);
+        }
+        // And the values should be 2× the original.
+        let dense = summed.to_dense();
+        let orig_dense = tt.to_dense();
+        for (a, b) in orig_dense.iter().zip(dense.iter()) {
+            assert!(approx(*b, 2.0 * *a, 1e-3),
+                "expected 2x, got {} vs {}", b, 2.0 * a);
         }
     }
 
