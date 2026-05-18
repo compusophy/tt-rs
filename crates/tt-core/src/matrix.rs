@@ -268,6 +268,44 @@ impl TtMatrix {
     pub fn compression_ratio(&self) -> f32 {
         self.dense_n_params() as f32 / self.n_params().max(1) as f32
     }
+
+    /// M ← s · M (in place). Same cost as `TtTensor::scale`.
+    pub fn scale(&mut self, s: f32) { self.tt.scale(s); }
+
+    /// M ← (round to (max_rank, tol)). Same algorithm as `TtTensor::round`.
+    pub fn round(&mut self, max_rank: usize, tol: f32) -> Result<(), TtError> {
+        self.tt.round(max_rank, tol)
+    }
+
+    /// Element-wise sum of two TT-matrices with identical (m_shape, n_shape).
+    /// Interior TT-ranks become the sum of the two operands' ranks; call
+    /// `round` after to truncate back.
+    pub fn add(&self, other: &Self) -> Result<Self, TtError> {
+        if self.m_shape != other.m_shape || self.n_shape != other.n_shape {
+            return Err(TtError::ShapeMismatch {
+                expected: [self.m_shape.clone(), self.n_shape.clone()].concat(),
+                got:      [other.m_shape.clone(), other.n_shape.clone()].concat(),
+            });
+        }
+        let tt = self.tt.add(&other.tt)?;
+        Ok(Self {
+            tt,
+            m_shape: self.m_shape.clone(),
+            n_shape: self.n_shape.clone(),
+        })
+    }
+}
+
+impl std::fmt::Display for TtMatrix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "TtMatrix rows={} cols={} d={} ranks={:?} params={} (dense {}, {:.1}× compression)",
+            self.rows(), self.cols(), self.d(),
+            self.tt.ranks(), self.n_params(), self.dense_n_params(),
+            self.compression_ratio(),
+        )
+    }
 }
 
 fn decompose(linear: usize, shape: &[usize]) -> Vec<usize> {

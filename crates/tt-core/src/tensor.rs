@@ -12,6 +12,8 @@
 //! (r_k = min(prod n_1..k, prod n_{k+1..d})); for low-rank-structured tensors
 //! they stay small and TT crushes dense storage.
 
+use std::fmt;
+
 use ndarray::{Array3, ArrayD, ArrayViewD, IxDyn};
 
 use crate::error::TtError;
@@ -216,39 +218,65 @@ impl TtTensor {
     /// ‖T‖² computed directly in TT form (no dense reconstruction).
     /// Cost O(d · n_max · r_max³).
     pub fn norm_sq(&self) -> f32 {
+        self.inner_product(self)
+    }
+
+    /// ‖T‖ — Frobenius (Euclidean) norm, computed without materialising the
+    /// dense tensor.
+    pub fn frobenius_norm(&self) -> f32 {
+        self.norm_sq().max(0.0).sqrt()
+    }
+
+    /// ⟨A, B⟩ — element-wise inner product of two TT-tensors with the same
+    /// shape, computed by contracting their cores against each other one
+    /// mode at a time. Cost O(d · n_max · r_max³). Panics if shapes differ
+    /// in size.
+    pub fn inner_product(&self, other: &Self) -> f32 {
+        debug_assert_eq!(self.shape, other.shape, "inner_product shape mismatch");
         if self.cores.is_empty() { return 0.0; }
-        let mut w = vec![1.0f32]; // (1, 1)
-        let mut w_dim = 1usize;
-        for g in &self.cores {
-            let (r_prev, n_k, r_k) = (g.shape()[0], g.shape()[1], g.shape()[2]);
-            debug_assert_eq!(r_prev, w_dim);
-            let mut w_new = vec![0.0f32; r_k * r_k];
+        // W has shape (r_A, r_B). Start with (1, 1) = 1.
+        let mut w = vec![1.0f32];
+        let mut wa = 1usize;
+        let mut wb = 1usize;
+        for k in 0..self.cores.len() {
+            let g_a = &self.cores[k];
+            let g_b = &other.cores[k];
+            let (ra_pre, n_k, ra_post) = (g_a.shape()[0], g_a.shape()[1], g_a.shape()[2]);
+            let (rb_pre, n_k_b, rb_post) = (g_b.shape()[0], g_b.shape()[1], g_b.shape()[2]);
+            debug_assert_eq!(n_k, n_k_b, "mode size mismatch at core {k}");
+            debug_assert_eq!(ra_pre, wa);
+            debug_assert_eq!(rb_pre, wb);
+
+            let mut w_new = vec![0.0f32; ra_post * rb_post];
             for i in 0..n_k {
-                // tmp[b, a'] = sum_a G[a, i, b] * W[a, a']      shape (r_k, r_prev)
-                let mut tmp = vec![0.0f32; r_k * r_prev];
-                for b in 0..r_k {
-                    for ap in 0..r_prev {
+                // tmp[a', bp] = sum_{a, b} W[a, b] · G_A[a, i, a'] · G_B[b, i, bp]
+                // factor as: tmp_intermediate[a', b] = sum_a W[a, b] * G_A[a, i, a']
+                //            tmp[a', bp]            = sum_b tmp_intermediate[a', b] * G_B[b, i, bp]
+                let mut tmp = vec![0.0f32; ra_post * rb_pre];
+                for ap in 0..ra_post {
+                    for bb in 0..rb_pre {
                         let mut s = 0.0f32;
-                        for a in 0..r_prev {
-                            s += g[[a, i, b]] * w[a * r_prev + ap];
+                        for aa in 0..ra_pre {
+                            s += w[aa * rb_pre + bb] * g_a[[aa, i, ap]];
                         }
-                        tmp[b * r_prev + ap] = s;
+                        tmp[ap * rb_pre + bb] = s;
                     }
                 }
-                // w_new[b, b'] += sum_{a'} tmp[b, a'] * G[a', i, b']
-                for b in 0..r_k {
-                    for bp in 0..r_k {
+                for ap in 0..ra_post {
+                    for bp in 0..rb_post {
                         let mut s = 0.0f32;
-                        for ap in 0..r_prev {
-                            s += tmp[b * r_prev + ap] * g[[ap, i, bp]];
+                        for bb in 0..rb_pre {
+                            s += tmp[ap * rb_pre + bb] * g_b[[bb, i, bp]];
                         }
-                        w_new[b * r_k + bp] += s;
+                        w_new[ap * rb_post + bp] += s;
                     }
                 }
             }
             w = w_new;
-            w_dim = r_k;
+            wa = ra_post;
+            wb = rb_post;
         }
+        // Final w is (1, 1).
         w[0]
     }
 
@@ -462,6 +490,19 @@ impl TtTensor {
     }
 }
 
+impl fmt::Display for TtTensor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let dense_n = self.dense_n_params();
+        let tt_n = self.n_params();
+        write!(
+            f,
+            "TtTensor shape={:?} ranks={:?} params={} (dense {}, {:.1}× compression)",
+            self.shape, self.ranks(), tt_n, dense_n,
+            self.compression_ratio()
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,6 +572,36 @@ mod tests {
         let tt_norm_sq = tt.norm_sq();
         assert!(approx(tt_norm_sq, dense_norm_sq, 1e-3),
                 "norm² mismatch: tt={tt_norm_sq}, dense={dense_norm_sq}");
+    }
+
+    #[test]
+    fn inner_product_matches_dense() {
+        let shape = [4, 5, 6];
+        let n: usize = shape.iter().product();
+        let a_v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.13).sin()).collect();
+        let b_v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.31).cos() * 0.7).collect();
+        let dense_dot: f32 = a_v.iter().zip(b_v.iter()).map(|(a, b)| a * b).sum();
+
+        let a_arr = Array::from_shape_vec(IxDyn(&shape), a_v).unwrap();
+        let b_arr = Array::from_shape_vec(IxDyn(&shape), b_v).unwrap();
+        let tt_a = TtTensor::from_dense(a_arr.view(), 32, 1e-12).unwrap();
+        let tt_b = TtTensor::from_dense(b_arr.view(), 32, 1e-12).unwrap();
+        let dot = tt_a.inner_product(&tt_b);
+        assert!(approx(dot, dense_dot, 1e-3),
+            "inner product mismatch: tt={} dense={}", dot, dense_dot);
+    }
+
+    #[test]
+    fn frobenius_norm_matches_sqrt_sum_sq() {
+        let shape = [3, 4, 5];
+        let n: usize = shape.iter().product();
+        let v: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.21).sin()).collect();
+        let dense_norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let arr = Array::from_shape_vec(IxDyn(&shape), v).unwrap();
+        let tt = TtTensor::from_dense(arr.view(), 32, 1e-12).unwrap();
+        let nrm = tt.frobenius_norm();
+        assert!(approx(nrm, dense_norm, 1e-3),
+            "norm mismatch: tt={} dense={}", nrm, dense_norm);
     }
 
     #[test]
