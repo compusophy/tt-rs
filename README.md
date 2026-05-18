@@ -119,6 +119,30 @@ entirely and is the natural foundation for the fused TT-attention kernel
 (v0.4) that will compete with FlashAttention-3 on the (memory,
 throughput, RULER accuracy) Pareto frontier.
 
+## Matrices the size of small datasets
+
+Building a TT-matrix doesn't require materialising a dense intermediate.
+`TtMatrix::from_cores` accepts cores directly, which lets us construct
+matrices whose dense form is physically impossible. Same `gpu_smart_ms`
+kernel as above; same RTX 3090 (24 GB).
+
+| rows    | cols    | d  | rank | dense size  | tt size  | cpu_tt_ms | gpu_smart_ms |     CPU↔GPU diff |
+|--------:|--------:|---:|-----:|------------:|---------:|----------:|-------------:|-----------------:|
+|  65 536 |  65 536 |  8 |   16 |     16.0 GB |  56.5 KB |     1 764 |          3.6 |          2.7e-8 |
+| 262 144 | 262 144 |  9 |   16 |    256.0 GB |  64.5 KB |     8 300 |         32.8 |          1.9e-8 |
+| 1 048 576 | 1 048 576 | 10 | 16 | **4 096.0 GB** | **72.5 KB** | 38 274 | **121** | **1.8e-8** |
+
+The bottom row: a **1 048 576 × 1 048 576 matrix** (over 10¹² entries,
+**4 TB dense**) collapses into **72.5 KB** of TT cores, and `y = M x`
+runs in **121 ms** on a single consumer GPU — bit-equivalent to the
+CPU result within f32 round-off (1.8 × 10⁻⁸). The dense form literally
+cannot exist on any single computer; the TT form is smaller than this
+README.
+
+This is the property — not the speedup ratio — that the v0.4 fused
+TT-attention kernel is built on. A long-context KV cache lives in the
+"dense doesn't fit but TT does" regime by default.
+
 ## Layout
 
 ```

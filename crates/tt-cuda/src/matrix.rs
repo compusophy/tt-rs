@@ -20,11 +20,11 @@ use tt_core::TtMatrix;
 
 use crate::tensor::{CudaTtRuntime, MAX_RANK};
 
-pub const MAX_D: usize = 8;
+pub const MAX_D: usize = 16;
 
 const KERNEL_SRC: &str = r#"
 #define MAX_RANK 64
-#define MAX_D 8
+#define MAX_D 16
 
 extern "C" __global__ void tt_matvec(
     const float* __restrict__ cores,

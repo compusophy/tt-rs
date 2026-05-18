@@ -28,6 +28,61 @@ impl TtMatrix {
     pub fn rows(&self) -> usize { self.m_shape.iter().product() }
     pub fn cols(&self) -> usize { self.n_shape.iter().product() }
 
+    /// Build a TT-matrix from pre-constructed cores. Lets you create matrices
+    /// whose dense form would not fit in RAM. The 2d cores must alternate
+    /// row-mode / col-mode and chain correctly: cores[k].shape() = (r_{k-1},
+    /// mode_k, r_k) with r_0 = r_{2d} = 1, mode_2k = m_k, mode_{2k+1} = n_k.
+    pub fn from_cores(
+        m_shape: &[usize],
+        n_shape: &[usize],
+        cores: Vec<ndarray::Array3<f32>>,
+    ) -> Result<Self, TtError> {
+        if m_shape.len() != n_shape.len() {
+            return Err(TtError::ShapeMismatch {
+                expected: m_shape.to_vec(),
+                got: n_shape.to_vec(),
+            });
+        }
+        let d = m_shape.len();
+        if cores.len() != 2 * d {
+            return Err(TtError::ShapeMismatch {
+                expected: vec![2 * d],
+                got: vec![cores.len()],
+            });
+        }
+        // Validate chain + interleaving.
+        let mut r_prev = 1usize;
+        for (k, core) in cores.iter().enumerate() {
+            let (r_pre, mode, r_post) = (core.shape()[0], core.shape()[1], core.shape()[2]);
+            if r_pre != r_prev {
+                return Err(TtError::ShapeMismatch {
+                    expected: vec![r_prev, mode, r_post],
+                    got: vec![r_pre, mode, r_post],
+                });
+            }
+            let expected_mode = if k % 2 == 0 { m_shape[k / 2] } else { n_shape[k / 2] };
+            if mode != expected_mode {
+                return Err(TtError::ShapeMismatch {
+                    expected: vec![r_pre, expected_mode, r_post],
+                    got: vec![r_pre, mode, r_post],
+                });
+            }
+            r_prev = r_post;
+        }
+        if r_prev != 1 {
+            return Err(TtError::InvalidRank { got: r_prev });
+        }
+
+        // Build the interleaved TT-tensor shape.
+        let interleaved_shape: Vec<usize> = m_shape
+            .iter()
+            .zip(n_shape.iter())
+            .flat_map(|(&m, &n)| [m, n])
+            .collect();
+        let tt = TtTensor { cores, shape: interleaved_shape };
+        Ok(Self { tt, m_shape: m_shape.to_vec(), n_shape: n_shape.to_vec() })
+    }
+
     /// Construct a TT-matrix from a dense (rows, cols) matrix by interleaving
     /// the row and column multi-indices, then running TT-SVD.
     pub fn from_dense(
@@ -289,6 +344,27 @@ mod tests {
         let y_dense = dense_matvec(&data, &x_vec);
         for (a, b) in y_tt.iter().zip(y_dense.iter()) {
             assert!((a - b).abs() < 1e-3, "random matvec mismatch: {} vs {}", a, b);
+        }
+    }
+
+    #[test]
+    fn from_cores_roundtrips_with_from_dense() {
+        // Decompose a small matrix, then rebuild from its own cores → matvec
+        // should agree with the original.
+        let rows = 16usize;
+        let cols = 16usize;
+        let v: Vec<f32> = (0..rows*cols).map(|i| ((i as f32) * 0.13).sin()).collect();
+        let data = Array2::from_shape_vec((rows, cols), v).unwrap();
+        let tm1 = TtMatrix::from_dense(&[4, 4], &[4, 4], data.view(), 8, 1e-8).unwrap();
+        let cores_clone = tm1.tt.cores.clone();
+        let tm2 = TtMatrix::from_cores(&[4, 4], &[4, 4], cores_clone).unwrap();
+
+        let x: Vec<f32> = (0..cols).map(|i| (i as f32) * 0.1 + 0.5).collect();
+        let x_arr = ndarray::ArrayD::from_shape_vec(IxDyn(&[4, 4]), x).unwrap();
+        let y1: Vec<f32> = tm1.matvec(x_arr.view()).unwrap().iter().copied().collect();
+        let y2: Vec<f32> = tm2.matvec(x_arr.view()).unwrap().iter().copied().collect();
+        for (a, b) in y1.iter().zip(y2.iter()) {
+            assert!((a - b).abs() < 1e-6, "from_cores roundtrip mismatch: {} vs {}", a, b);
         }
     }
 
