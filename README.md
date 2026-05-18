@@ -38,22 +38,25 @@ the CUDA TT-attention kernel is the v0.2 ambition.
 
 ## Status
 
-**v0.1 (this commit)**
-- `tt-core` complete: TT-SVD decomposition with rank+tolerance truncation,
-  exact reconstruction, single-element evaluation, in-place TT-norm,
-  re-rounding. All operations CPU, f64 SVD with f32 storage.
-- 5 unit tests prove correctness on random tensors, exact rank-1
-  factorizations, single-element lookups, ‖T‖², and rank truncation.
-- `tt-bench` (criterion harness) for decomposition and storage ratio.
-- `tt-cuda` scaffold; kernels land in v0.2.
+**v0.2 (this commit)**
+- `tt-core`: `TtTensor` (TT-SVD, to_dense, eval, in-place norm_sq, round)
+  AND `TtMatrix` (interleaved (m_1, n_1, …, m_d, n_d) layout, TT-aware
+  matvec that contracts mode-by-mode — no dense reconstruction).
+- 9 unit tests cover roundtrip, exact rank-1 factorization, element eval,
+  ‖T‖² without dense, rank truncation, identity matvec, rank-1 matvec,
+  random small matvec, and compression-ratio sanity.
+- `tt-cuda`: cudarc 0.13 + CUDA 11.7 toolchain verified end-to-end on the
+  RTX 3090 — NVRTC compiles a kernel, launch dispatches, device→host copy
+  matches CPU bit-for-bit on a 64k-float vector_add. `build.rs` handles
+  the Windows NVRTC DLL ABI-version naming so `cargo test` just works.
+- `tt-bench`: criterion harness for decomposition + element-eval timing.
 
-**v0.2 (planned)**
-- TT-aware matvec on CPU (no dense reconstruction)
-- CUDA TT-matvec kernel via `cudarc`, fp16 with tensor-core wmma
+**v0.3 (planned)**
+- CUDA TT-matvec kernel (fp16, tensor cores via `wmma`)
 - Benchmark vs `tntorch` (target: 50× on `from_dense`, 100× on `round`)
 - PyO3 bindings (`tt-py`) so it drops into HF Transformers pipelines
 
-**v0.3 (the ambition)**
+**v0.4 (the ambition)**
 - Fused `tt_attention_fwd` CUDA kernel
 - KV cache replacement in a `candle`-based Llama-3 inference loop
 - Headline benchmark vs FlashAttention-3 on the (memory, throughput,
@@ -63,12 +66,14 @@ the CUDA TT-attention kernel is the v0.2 ambition.
 ## Run
 
 ```sh
-cargo test --workspace --release      # unit tests across the workspace
-cargo bench -p tt-bench               # decomposition + storage benchmarks
+cargo test --workspace --release                       # CPU unit tests
+cargo test -p tt-cuda --release -- --ignored           # GPU smoke test
+cargo bench -p tt-bench                                # criterion benchmarks
 ```
 
-Hardware target for v0.2/0.3: NVIDIA Ampere or newer with ≥16 GB VRAM.
-Verified development hardware: RTX 3090 (Ampere, SM 8.6, 24 GB).
+Hardware target for v0.3/v0.4: NVIDIA Ampere or newer with ≥16 GB VRAM.
+Verified development hardware: RTX 3090 (Ampere, SM 8.6, 24 GB),
+CUDA Toolkit 11.7 on Windows.
 
 ## Layout
 

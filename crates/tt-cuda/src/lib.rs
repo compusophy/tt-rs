@@ -1,6 +1,6 @@
-//! `tt-cuda` — GPU TT operations. Stub for v0.1; kernels land in v0.2.
-//!
-//! Planned exports:
-//! - `CudaTtTensor::upload(&TtTensor, &CudaDevice)` — push cores to device fp16
-//! - `CudaTtTensor::matvec(x, y)` — fused TT-matvec compute kernel
-//! - `tt_attention_fwd(q, k_tt, v_tt, out, mask)` — fused TT-attention
+//! `tt-cuda` — GPU TT operations. v0.1 ships a smoke test that proves the
+//! CUDA toolchain works end-to-end on the host. Real TT kernels (TT-matvec,
+//! TT-attention) land in v0.2.
+
+#[cfg(feature = "cuda-11070")]
+pub mod smoke;

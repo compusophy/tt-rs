@@ -8,6 +8,8 @@
 
 pub mod error;
 pub mod tensor;
+pub mod matrix;
 
 pub use error::TtError;
 pub use tensor::TtTensor;
+pub use matrix::TtMatrix;
