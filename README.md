@@ -102,8 +102,10 @@ small kernels — `row_contract` + `col_contract` — dispatched in
 sequence) instead of the naive "one thread per output element" approach.
 The result on the 3090:
 
-- **47× faster than dense matvec at 4096×4096** (0.32 ms vs 15.0 ms)
-- **335× faster than dense matvec at 16384×16384** (0.98 ms vs 329 ms)
+- **0.32 ms** for the TT matvec at 4096×4096, and **0.98 ms** at 16384×16384
+- For scale, a naive single-threaded CPU dense loop takes 15.0 ms and 329 ms
+  on the same sizes. That loop is not an optimized BLAS baseline, so these
+  numbers are not a speedup claim against dense GPU matvec.
 
 At those sizes we're memory-bandwidth bound on a few-KB working
 buffer rather than compute bound on a million-FLOP matrix. The
